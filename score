@@ -1,1 +1,366 @@
 
+---
+name: 
+SCORE Team – Job Monitoring & Incident Handling
+description: >
+Use this skill when monitoring batch jobs, handling job failures, analyzing errors, and rerunning jobs in production 
+---
+
+# SCORE Team – Job Monitoring & Incident Handling
+
+TThis skill is used for monitoring scheduled jobs, identifying failures, analyzing errors, and performing rerun the jobs or corrective actions. It ensures smooth job execution and minimal business impact.
+---
+
+## Step 1 — Read the Ticket
+
+Before running any commands, extract these key fields from the ticket:
+
+| Field | What to look for |
+|---|---|
+| **System type** | System type	AS400-MBS001(PROD) |
+| **Alert / error message** | Job started, MSGW, ended abnormally, job did not start, Po conformation |
+
+
+Ask the user to paste ticket details if not already provided.
+
+---
+
+## Step 2 — When to Use
+
+Run these first to get a high-level picture. Do NOT skip ahead.
+
+### NetApp ONTAP
+
+```bash
+# Check cluster health
+cluster show -health true
+
+# List all SnapMirror relationships and their status
+snapmirror show
+
+# Show relationships that are NOT healthy
+snapmirror show -health false
+
+# Check for any recent EMS alerts related to replication
+event log show -severity ERROR -time-range <last 24h>
+
+# Show lag time on all relationships
+snapmirror show -fields lag-time, state, last-transfer-end-timestamp
+```
+
+### IBM SVC / FlashSystem
+
+```bash
+# Check overall system health
+svcinfo lssystem
+
+# List all remote copy relationships
+svcinfo lsrcrelationship
+
+# Show relationships with errors
+svcinfo lsrcrelationship | grep -i "inconsistent\|stopped\|idling"
+
+# Check remote copy groups (consistency groups)
+svcinfo lsrcconsistgrp
+
+# View system events and errors
+svcinfo lseventlog -fixed no
+```
+
+### IBM DS8000
+
+```bash
+# Check pprc (peer-to-peer remote copy) paths
+lspprc
+
+# List volume pairs
+lsvolgrp
+
+# Show session status
+lssession
+```
+
+---
+
+## Step 3 — Drill Into the Broken Relationship
+
+Once you have the relationship name from Step 2:
+
+### NetApp
+
+```bash
+# Detailed view of one relationship
+snapmirror show -destination-path <vserver>:<volume>
+
+# Show transfer history — look for errors or aborts
+snapmirror show-history -destination-path <vserver>:<volume>
+
+# Check the source volume
+volume show -vserver <src-vserver> -volume <src-volume>
+
+# Check destination volume
+volume show -vserver <dst-vserver> -volume <dst-volume>
+
+# Check network connectivity between clusters
+network ping -lif <intercluster-lif> -destination <peer-cluster-ip>
+
+# Check intercluster peering health
+cluster peer show
+vserver peer show
+```
+
+### IBM SVC / FlashSystem
+
+```bash
+# Detailed info on one relationship
+svcinfo lsrcrelationship <relationship_id>
+
+# Check the remote copy partner system
+svcinfo lspartnership
+
+# Check FC or IP link status to remote site
+svcinfo lsportfc
+svcinfo lsip
+
+# View copy progress
+svcinfo lsrcrelationship -delim : <id> | grep -i "progress\|status\|state"
+```
+
+---
+
+## Step 4 — Common Issues & Fixes
+
+### ❌ Relationship is "Broken-off" (NetApp)
+
+**Cause:** Snapshot on source/destination is missing or corrupt.
+
+```bash
+# Resync the relationship (direction: source → destination)
+snapmirror resync -destination-path <vserver>:<volume>
+
+# Monitor until it's in sync
+snapmirror show -destination-path <vserver>:<volume> -fields state, lag-time
+```
+
+> ⚠️ Resync will OVERWRITE the destination with source data. Confirm with customer before running.
+
+---
+
+### ❌ Relationship is "Stopped" / "Idle" (IBM SVC)
+
+**Cause:** Manually stopped, or link went down.
+
+```bash
+# Start the relationship
+svctask startrcrelationship <relationship_id>
+
+# Check status after start
+svcinfo lsrcrelationship <relationship_id>
+```
+
+---
+
+### ❌ High Lag Time (NetApp)
+
+**Cause:** Network bottleneck, large source volume change rate, or transfer error.
+
+```bash
+# Check current transfer in progress
+snapmirror show-transfers
+
+# Abort current stalled transfer and retry
+snapmirror abort -destination-path <vserver>:<volume>
+snapmirror update -destination-path <vserver>:<volume>
+
+# Check intercluster LIF bandwidth
+network port show -fields speed
+```
+
+---
+
+### ❌ Inconsistent State (IBM SVC)
+
+**Cause:** Write I/O arrived at primary but not secondary (link dropped mid-write).
+
+```bash
+# Stop the relationship before making changes
+svctask stoprcrelationship -access <relationship_id>
+
+# Resync from primary to secondary
+svctask startrcrelationship -force <relationship_id>
+```
+
+---
+
+### ❌ Peering / Authentication Error (NetApp)
+
+```bash
+# Verify cluster peer passphrase and status
+cluster peer show
+cluster peer modify -cluster <peer-name> -update-password
+
+# Re-ping the peer cluster
+network ping -lif <intercluster-lif> -destination <peer-cluster-mgmt-ip>
+```
+
+---
+
+## Step 5 — Route to Network Team (if network is the cause)
+
+If your diagnostics point to a **network problem** (not a storage config issue), stop here and
+route the ticket to the Network team. Do NOT attempt storage fixes if the link itself is down.
+
+### Signs that Network Team owns this
+
+- Ping between intercluster LIFs is failing or showing packet loss
+- FC or IP ports between sites show as down or degraded
+- Replication was working fine until a network change/maintenance window
+- Lag spiked suddenly without any storage-side changes
+- Multiple unrelated replication relationships all broke at the same time
+
+---
+
+### Commands to Run BEFORE Handing Off
+
+Collect this output and paste it into the network ticket so they have full context:
+
+#### NetApp
+
+```bash
+# Test connectivity from storage to remote site
+network ping -lif <intercluster-lif> -destination <remote-intercluster-ip> -count 10
+
+# Show intercluster LIF status and IP addresses
+network interface show -role intercluster
+
+# Show physical port status
+network port show -fields link, speed, mtu
+
+# Show any dropped packets or errors on ports
+network port show -fields recv-error, send-error
+
+# Check MTU — mismatch is a common cause of replication failures
+network port show -fields mtu
+```
+
+#### IBM SVC / FlashSystem
+
+```bash
+# Show IP partnership status and remote IPs
+svcinfo lspartnership
+
+# Check ethernet port status
+svcinfo lsip
+
+# Check FC port status (for FC-based remote copy)
+svcinfo lsportfc
+
+# Show node-level errors that may point to link issues
+svcinfo lseventlog -fixed no | grep -i "port\|link\|network\|partner"
+```
+
+---
+
+### What to Include in the Network Team Ticket
+
+When you route, always include these fields — do not hand off a blank ticket:
+
+| Field | What to provide |
+|---|---|
+| **Ticket #** | Original storage ticket number |
+| **Impact** | Which replication relationship(s) are down, which volumes/apps are affected |
+| **Source site** | Site name, storage system IP, intercluster LIF IPs |
+| **Destination site** | Site name, storage system IP, intercluster LIF IPs |
+| **Port / Protocol** | TCP port 11104/11105 (NetApp), port 3260 / FC (IBM) |
+| **Failure started** | Exact time replication dropped |
+| **Last good time** | When was it last confirmed working |
+| **Ping result** | Output of ping test from Step above |
+| **Error message** | Exact error from storage system (EMS alert, event log) |
+| **Change window?** | Was there any network maintenance around the failure time? |
+
+---
+
+### Ticket Routing Template
+
+> **[ROUTE TO NETWORK TEAM]**
+>
+> Storage replication is down between **[Site A]** and **[Site B]**.
+> Storage-side investigation confirms the relationship failed due to a network connectivity issue.
+>
+> - **Storage systems:** [System A IP] → [System B IP]
+> - **Protocol/Ports:** [NetApp ONTAP intercluster TCP 11104/11105 | IBM SVC iSCSI port 3260 | IBM FC]
+> - **Failure time:** [timestamp]
+> - **Ping result:** [paste output]
+> - **Error:** [paste exact error]
+>
+> Please check link status, routing, and firewall rules between the two sites.
+> Storage team is standing by to re-test and resync once connectivity is restored.
+
+---
+
+## Step 6 — Log Collection (for Escalation)
+
+If the issue cannot be resolved, collect these before escalating:
+
+### NetApp
+
+```bash
+# Full EMS log dump
+event log show -severity ERROR -time-range <range> > ems_errors.log
+
+# AutoSupport for the node
+system node autosupport invoke -node * -type all -message "replication-debug"
+```
+
+### IBM SVC / FlashSystem
+
+```bash
+# Collect support package from GUI or CLI
+svcinfo dumperrlog
+svctask dumpdump
+
+# Download the support package from:
+# GUI → Support → Download Support Package
+```
+
+---
+
+## Step 7 — Close / Resolve Ticket
+
+Before closing:
+
+- [ ] Confirm relationship is in **Synchronized** (NetApp) or **Consistent synchronized** (IBM) state
+- [ ] Confirm lag time is within SLA (typically < 30 min for async, near-zero for sync)
+- [ ] Document root cause and fix applied in the ticket
+- [ ] Ask customer to confirm no alerts are firing
+- [ ] If a resync was done — confirm destination data is intact
+
+---
+
+## Quick Reference — Status Meanings
+
+### NetApp SnapMirror States
+
+| State | Meaning |
+|---|---|
+| `Snapmirrored` | Healthy, in sync |
+| `Broken-off` | Relationship broken, needs resync |
+| `Uninitialized` | Never seeded — needs initialize |
+| `Quiesced` | Paused by admin |
+
+### IBM SVC RC Relationship States
+
+| State | Meaning |
+|---|---|
+| `consistent_synchronized` | Healthy |
+| `consistent_stopped` | Stopped, data consistent |
+| `inconsistent_stopped` | Stopped, data MAY be inconsistent ⚠️ |
+| `idling` | In sync, no active I/O |
+
+---
+
+## References
+
+- NetApp ONTAP SnapMirror Docs: https://docs.netapp.com/us-en/ontap/data-protection/
+- IBM SVC Remote Copy Guide: https://www.ibm.com/docs/en/sanvolumecontroller
+- IBM FlashSystem Remote Copy: https://www.ibm.com/docs/en/flashsystem-9x00
